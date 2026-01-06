@@ -53,6 +53,7 @@ def apply_patch(hogging_detection=None, real_threads=None):
 
     _patch_module_locks()
     _unpatch_logging_handlers_lock()
+    _patch_wait_to_be_notified()
 
     global HUB
     HUB = gevent.get_hub()
@@ -200,3 +201,26 @@ def defer_to_thread(func, threadname):
     parent_uuid = get_thread_uuid(threading.current_thread())
     pool = gevent.get_hub().threadpool
     return pool.spawn(run).wait
+
+
+def __wait_to_be_notified_patch(self, rawlink):
+    resume_this_greenlet = getcurrent().switch
+    the_hub = self.hub or get_hub()
+    if self.hub is None:
+        print(f"1: {self.hub=}, {the_hub=}")
+    if rawlink:
+        self.rawlink(resume_this_greenlet)
+    else:
+        self._notifier.args[0].append(resume_this_greenlet)
+    try:
+        print(f"2: {self.hub=}, {the_hub=}")
+        self._switch_to_hub(the_hub)
+        resume_this_greenlet = None
+    finally:
+        self._quiet_unlink_all(resume_this_greenlet)
+
+def _patch_wait_to_be_notified():
+    import gevent._abstract_linkable as mod
+    import inspect
+    exec(inspect.getsource(__wait_to_be_notified_patch), mod.__dict__)
+    mod.AbstractLinkable._AbstractLinkable__wait_to_be_notified = mod.__dict__[__wait_to_be_notified_patch.__name__]
