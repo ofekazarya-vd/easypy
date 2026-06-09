@@ -16,6 +16,7 @@ import signal
 import os
 from collections import Counter
 from easypy.logging import DeferredEasypyLogger
+from gevent.hub import getcurrent
 
 import easypy._multithreading_init  # noqa
 from easypy.bunch import Bunch
@@ -327,6 +328,7 @@ class TagAlongThread(object):
         self._func = func
         self.minimal_sleep = minimal_sleep
         self.wait_for_trigger = wait_for_trigger
+        self._name = name
 
         self._lock = threading.RLock()
 
@@ -345,49 +347,74 @@ class TagAlongThread(object):
 
         self._thread = threading.Thread(target=self._loop, daemon=True, name=name)
         self._thread.start()
+        self._print(f"tat started: {name}")
+
+    def _print(self, message):
+        if self.name.endswith("_refresh"):
+            print(message)
 
     def _loop(self):
+        gli = id(getcurrent())
+        self._print(f"tatl {gli} 1 {self._name}")
         while self.__alive:
+            self._print(f"tatl {gli} 2")
             if self.wait_for_trigger:
+                self._print(f"tatl {gli} 3")
                 self._iteration_trigger.wait()
-
+            self._print(f"tatl {gli} 4")
             # Mark that we are now iterating
             self._not_iterating.clear()
+            self._print(f"tatl {gli} 5")
             self._iterating.set()
+            self._print(f"tatl {gli} 6")
             self._generation += 1
+            self._print(f"tatl {gli} 7 generation {self._generation}")
 
             try:
                 exc, result = None, self._func()
+                self._print(f"tatl {gli} 8")
             except Exception as e:
+                self._print(f"tatl {gli} 9 error")
                 exc, result = e, None
 
             self._results[self._generation] = exc, result
             self._results.pop(self._generation - 3, None)
+            self._print(f"tatl {gli} 10 pop generation {self._generation - 3}")
 
             # Mark that we are no longer iterating
             self._iterating.clear()
+            self._print(f"tatl {gli} 12")
             self._not_iterating.set()
+            self._print(f"tatl {gli} 13")
 
             time.sleep(self.minimal_sleep)
+            self._print(f"tatl {gli} 14")
             self._iteration_trigger.clear()
+            self._print(f"tatl {gli} 15")
 
+        self._print(f"tatl {gli} 16")
         # Set all events so nothing will get blocked
         self._iteration_trigger.set()
+        self._print(f"tatl {gli} 17")
         self._iterating.set()
+        self._print(f"tatl {gli} 18")
         self._not_iterating.set()
+        self._print(f"tatl {gli} 19")
 
     def __repr__(self):
         return 'TagAlongThread<%s>' % (self._thread.name,)
 
     def wait(self, current_generation=False):
         assert self.__alive, '%s is dead' % self
-
+        gli = id(getcurrent())
+        self._print(f"tatw {gli} 1 {self._name}")
         target_generation = self._generation + (1 - current_generation)
-
+        self._print(f"tatw {gli} 2")
         while True:
             self._iteration_trigger.set()  # Signal that we want an iteration
-
+            self._print(f"tatw {gli} 3")
             while not self._iterating.wait(.1):  # Wait until an iteration starts
+                self._print(f"tatw {gli} 4")
                 # It is possible that we missed the loop and _iterating was already
                 # cleared. If this is the case, _not_iterating will not be set -
                 # and we can use it as a signal to stop waiting for iteration.
@@ -395,13 +422,13 @@ class TagAlongThread(object):
                     break
             else:
                 self._not_iterating.wait()  # Wait until it finishes
-
+            self._print(f"tatw {gli} 5")
             ret = self._results.get(target_generation)
             if ret:
                 # make sure that this iteration started *after* this call was made,
                 # otherwise wait for the next iteration
                 break
-
+        self._print(f"tatw {gli} 6")
         # To avoid races, copy last exception and result to local variables
         last_exception, last_result = ret
         if last_exception:
@@ -412,6 +439,7 @@ class TagAlongThread(object):
     __call__ = wait
 
     def _kill(self, wait=True):
+        self._print(f"tat ended: {self._name}")
         self.__alive = False
         self._iteration_trigger.set()
         if wait:
