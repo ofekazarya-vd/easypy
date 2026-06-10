@@ -350,7 +350,7 @@ class TagAlongThread(object):
         self._print(f"tat started: {name}")
 
     def _print(self, message):
-        if self.name.endswith("_refresh"):
+        if self._name.endswith("_refresh"):
             print(message)
 
     def _loop(self):
