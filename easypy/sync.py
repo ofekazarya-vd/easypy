@@ -321,6 +321,13 @@ def shared_contextmanager(func):
     return inner
 
 
+def _describe_event(event):
+    # linkcount() exists only on gevent events; a waiter that gevent parks on a pending
+    # notifier is not counted in it
+    links = event.linkcount() if hasattr(event, 'linkcount') else '?'
+    return "%s(links=%s)" % ("set" if event.is_set() else "clear", links)
+
+
 class TagAlongThread(object):
 
     def __init__(self, func, name, minimal_sleep=0, wait_for_trigger=True):
@@ -355,6 +362,8 @@ class TagAlongThread(object):
             self._not_iterating.clear()
             self._iterating.set()
             self._generation += 1
+            _logger.debug("%s - generation %s started, iterating=%s",
+                          self, self._generation, _describe_event(self._iterating))
 
             try:
                 exc, result = None, self._func()
@@ -367,10 +376,14 @@ class TagAlongThread(object):
             # Mark that we are no longer iterating
             self._iterating.clear()
             self._not_iterating.set()
+            _logger.debug("%s - generation %s finished (%s), kept results %s, not_iterating=%s",
+                          self, self._generation, "failed" if exc else "ok",
+                          sorted(self._results), _describe_event(self._not_iterating))
 
             time.sleep(self.minimal_sleep)
             self._iteration_trigger.clear()
 
+        _logger.debug("%s - loop exited at generation %s", self, self._generation)
         # Set all events so nothing will get blocked
         self._iteration_trigger.set()
         self._iterating.set()
@@ -383,17 +396,24 @@ class TagAlongThread(object):
         assert self.__alive, '%s is dead' % self
 
         target_generation = self._generation + (1 - current_generation)
+        _logger.debug("%s - %s waiting for generation %s (current %s, current_generation=%s)",
+                      self, _get_my_ident(), target_generation, self._generation, current_generation)
 
         while True:
             self._iteration_trigger.set()  # Signal that we want an iteration
 
+            _logger.debug("%s - waiting for an iteration to start, iterating=%s, not_iterating=%s",
+                          self, _describe_event(self._iterating), _describe_event(self._not_iterating))
             while not self._iterating.wait(.1):  # Wait until an iteration starts
                 # It is possible that we missed the loop and _iterating was already
                 # cleared. If this is the case, _not_iterating will not be set -
                 # and we can use it as a signal to stop waiting for iteration.
                 if self._not_iterating.is_set():
+                    _logger.debug("%s - missed iteration, generation %s already finished", self, self._generation)
                     break
             else:
+                _logger.debug("%s - generation %s running, waiting for it to finish, not_iterating=%s",
+                              self, self._generation, _describe_event(self._not_iterating))
                 self._not_iterating.wait()  # Wait until it finishes
 
             ret = self._results.get(target_generation)
@@ -401,7 +421,10 @@ class TagAlongThread(object):
                 # make sure that this iteration started *after* this call was made,
                 # otherwise wait for the next iteration
                 break
+            _logger.debug("%s - generation %s not in results %s (current %s), retrying",
+                          self, target_generation, sorted(self._results), self._generation)
 
+        _logger.debug("%s - got generation %s", self, target_generation)
         # To avoid races, copy last exception and result to local variables
         last_exception, last_result = ret
         if last_exception:
@@ -412,6 +435,7 @@ class TagAlongThread(object):
     __call__ = wait
 
     def _kill(self, wait=True):
+        _logger.debug("%s - killed at generation %s", self, self._generation)
         self.__alive = False
         self._iteration_trigger.set()
         if wait:
