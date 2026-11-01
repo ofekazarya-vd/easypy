@@ -14,8 +14,14 @@ import logging
 import atexit
 import signal
 import os
+import traceback
 from collections import Counter
 from easypy.logging import DeferredEasypyLogger
+
+try:
+    from greenlet import getcurrent as _getcurrent_greenlet
+except ImportError:
+    _getcurrent_greenlet = None
 
 import easypy._multithreading_init  # noqa
 from easypy.bunch import Bunch
@@ -321,11 +327,42 @@ def shared_contextmanager(func):
     return inner
 
 
-def _describe_event(event):
+def _event_state(event):
     # linkcount() exists only on gevent events; a waiter that gevent parks on a pending
     # notifier is not counted in it
-    links = event.linkcount() if hasattr(event, 'linkcount') else '?'
-    return "%s(links=%s)" % ("set" if event.is_set() else "clear", links)
+    return event.is_set(), (event.linkcount() if hasattr(event, 'linkcount') else '?')
+
+
+def _format_event_state(state):
+    is_set, links = state
+    return "%s(links=%s)" % ("set" if is_set else "clear", links)
+
+
+# Every generation start/finish wakes all waiters, so a waiter that sat through this many
+# of them in the same phase was not woken
+_TAG_ALONG_STUCK_GENERATIONS = 3
+
+
+class _TagAlongWaiter(object):
+    __slots__ = ('ident', 'greenlet', 'target', 'phase', 'started_mark', 'finished_mark',
+                 'event_state', 'reported_at')
+
+    def __init__(self, target):
+        self.ident = _get_my_ident()
+        self.greenlet = _getcurrent_greenlet() if _getcurrent_greenlet else None
+        self.target = target
+        self.phase = None
+        self.reported_at = None
+
+    def enter_phase(self, phase, tat, event):
+        self.phase = phase
+        self.started_mark = tat._generation
+        self.finished_mark = tat._finished_generations
+        self.event_state = _event_state(event)
+
+    def stack(self):
+        frame = getattr(self.greenlet, 'gr_frame', None)
+        return ''.join(traceback.format_stack(frame)) if frame else '<no greenlet frame>'
 
 
 class TagAlongThread(object):
@@ -346,6 +383,8 @@ class TagAlongThread(object):
         self._last_exception = None
         self._last_result = None
         self._generation = 0
+        self._finished_generations = 0
+        self._waiters = {}
 
         self.__alive = True
         self._results = {}
@@ -362,8 +401,6 @@ class TagAlongThread(object):
             self._not_iterating.clear()
             self._iterating.set()
             self._generation += 1
-            _logger.debug("%s - generation %s started, iterating=%s",
-                          self, self._generation, _describe_event(self._iterating))
 
             try:
                 exc, result = None, self._func()
@@ -376,9 +413,9 @@ class TagAlongThread(object):
             # Mark that we are no longer iterating
             self._iterating.clear()
             self._not_iterating.set()
-            _logger.debug("%s - generation %s finished (%s), kept results %s, not_iterating=%s",
-                          self, self._generation, "failed" if exc else "ok",
-                          sorted(self._results), _describe_event(self._not_iterating))
+            self._finished_generations += 1
+            if self._waiters:
+                self._report_stuck_waiters()
 
             time.sleep(self.minimal_sleep)
             self._iteration_trigger.clear()
@@ -392,39 +429,64 @@ class TagAlongThread(object):
     def __repr__(self):
         return 'TagAlongThread<%s>' % (self._thread.name,)
 
+    def _report_stuck_waiters(self):
+        for waiter in list(self._waiters.values()):
+            if waiter.reported_at is not None:
+                continue
+            if waiter.phase == 'start' and self._generation - waiter.started_mark >= _TAG_ALONG_STUCK_GENERATIONS:
+                reason = "waiting for an iteration to start, but %s generations started since" % (
+                    self._generation - waiter.started_mark)
+            elif waiter.phase == 'finish' and self._finished_generations - waiter.finished_mark >= _TAG_ALONG_STUCK_GENERATIONS:
+                reason = "waiting for the iteration to finish, but %s generations finished since" % (
+                    self._finished_generations - waiter.finished_mark)
+            elif waiter.target not in self._results and waiter.target < self._generation - 2:
+                reason = "its target generation was already evicted from the results"
+            else:
+                continue
+            waiter.reported_at = self._generation
+            _logger.debug(
+                "%s - STUCK WAITER %s: %s. target generation %s, phase entered at generation %s "
+                "(%s finished), event on entering the phase: %s; now generation %s, kept results %s, "
+                "iterating=%s, not_iterating=%s, greenlet=%r\n%s",
+                self, waiter.ident, reason, waiter.target, waiter.started_mark, waiter.finished_mark,
+                _format_event_state(waiter.event_state), self._generation, sorted(self._results),
+                _format_event_state(_event_state(self._iterating)),
+                _format_event_state(_event_state(self._not_iterating)),
+                waiter.greenlet, waiter.stack())
+
     def wait(self, current_generation=False):
         assert self.__alive, '%s is dead' % self
 
         target_generation = self._generation + (1 - current_generation)
-        _logger.debug("%s - %s waiting for generation %s (current %s, current_generation=%s)",
-                      self, _get_my_ident(), target_generation, self._generation, current_generation)
+        waiter = _TagAlongWaiter(target_generation)
+        self._waiters[id(waiter)] = waiter
 
-        while True:
-            self._iteration_trigger.set()  # Signal that we want an iteration
+        try:
+            while True:
+                self._iteration_trigger.set()  # Signal that we want an iteration
 
-            _logger.debug("%s - waiting for an iteration to start, iterating=%s, not_iterating=%s",
-                          self, _describe_event(self._iterating), _describe_event(self._not_iterating))
-            while not self._iterating.wait(.1):  # Wait until an iteration starts
-                # It is possible that we missed the loop and _iterating was already
-                # cleared. If this is the case, _not_iterating will not be set -
-                # and we can use it as a signal to stop waiting for iteration.
-                if self._not_iterating.is_set():
-                    _logger.debug("%s - missed iteration, generation %s already finished", self, self._generation)
+                waiter.enter_phase('start', self, self._iterating)
+                while not self._iterating.wait(.1):  # Wait until an iteration starts
+                    # It is possible that we missed the loop and _iterating was already
+                    # cleared. If this is the case, _not_iterating will not be set -
+                    # and we can use it as a signal to stop waiting for iteration.
+                    if self._not_iterating.is_set():
+                        break
+                else:
+                    waiter.enter_phase('finish', self, self._not_iterating)
+                    self._not_iterating.wait()  # Wait until it finishes
+
+                ret = self._results.get(target_generation)
+                if ret:
+                    # make sure that this iteration started *after* this call was made,
+                    # otherwise wait for the next iteration
                     break
-            else:
-                _logger.debug("%s - generation %s running, waiting for it to finish, not_iterating=%s",
-                              self, self._generation, _describe_event(self._not_iterating))
-                self._not_iterating.wait()  # Wait until it finishes
+        finally:
+            self._waiters.pop(id(waiter), None)
+            if waiter.reported_at is not None:
+                _logger.debug("%s - STUCK WAITER %s left wait() at generation %s, reported at generation %s",
+                              self, waiter.ident, self._generation, waiter.reported_at)
 
-            ret = self._results.get(target_generation)
-            if ret:
-                # make sure that this iteration started *after* this call was made,
-                # otherwise wait for the next iteration
-                break
-            _logger.debug("%s - generation %s not in results %s (current %s), retrying",
-                          self, target_generation, sorted(self._results), self._generation)
-
-        _logger.debug("%s - got generation %s", self, target_generation)
         # To avoid races, copy last exception and result to local variables
         last_exception, last_result = ret
         if last_exception:
@@ -435,7 +497,6 @@ class TagAlongThread(object):
     __call__ = wait
 
     def _kill(self, wait=True):
-        _logger.debug("%s - killed at generation %s", self, self._generation)
         self.__alive = False
         self._iteration_trigger.set()
         if wait:
