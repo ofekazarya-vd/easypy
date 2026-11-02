@@ -265,6 +265,47 @@ this_module = import_module(__name__)
 _BOOTSTRAPPERS |= {threading, this_module}
 
 
+_MAX_DESCRIBED_WAIT_OBJECTS = 4
+
+
+def _describe_wait_objects(frame):
+    """
+    Describes the wakeup state of the gevent objects the innermost two frames are waiting on:
+    the frame locals, and the attributes of the frame's ``self``. Relies on ``_debug_describe``,
+    which only the instrumented gevent build provides, so this is empty with a stock gevent.
+    """
+    seen = set()
+    lines = []
+    for f in (frame, frame.f_back):
+        if f is None:
+            break
+        try:
+            local_items = list(f.f_locals.items())
+        except Exception:
+            continue
+        try:
+            # Bypasses the object's own attribute lookup, which on an rpyc netref is a remote call
+            self_dict = object.__getattribute__(f.f_locals.get('self'), '__dict__')
+            self_items = list(self_dict.items()) if isinstance(self_dict, dict) else []
+        except Exception:
+            self_items = []
+        candidates = local_items + [('self.' + name, value) for name, value in self_items]
+        for name, value in candidates:
+            describe = getattr(type(value), '_debug_describe', None)
+            if describe is None or id(value) in seen:
+                continue
+            seen.add(id(value))
+            try:
+                description = describe(value)
+            except Exception as exc:
+                description = 'failed to describe: %r' % (exc,)
+            lines.append('  waits-on %s:%s -> %s' % (
+                f.f_code.co_name, name, description.replace('\n', '\n      ')))
+            if len(lines) >= _MAX_DESCRIBED_WAIT_OBJECTS:
+                return lines
+    return lines
+
+
 def get_thread_trees(including_this=True):
     """
     Returns raw information about currently active threads, including their stack frames, and their immediate child-threads.
@@ -302,6 +343,10 @@ def get_thread_trees(including_this=True):
             # show the entire stack if it's this thread, don't skip ('after_module') anything
             show_all = thread_ident in (current_ident, main_ident)
             formatted = format_thread_stack(frame, skip_modules=[] if show_all else _BOOTSTRAPPERS) if frame else ''
+            if frame:
+                wait_objects = _describe_wait_objects(frame)
+                if wait_objects:
+                    formatted += '\n'.join(wait_objects) + '\n'
         stacks[thread_ident] = formatted, time.time(), (id(frame) if frame else 0)
 
     def add_thread(parent_thread, parent):
